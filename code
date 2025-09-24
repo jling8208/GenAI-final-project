@@ -1,0 +1,855 @@
+// @ts-nocheck
+const DEFAULT_SYSTEM_PROMPT = 'You are a professional assistant helping the user answer questions about their emails. Always respond in a clear, concise, and professional tone. When answering questions, infer context from the emails but never invent facts. If unsure, say so clearly and offer to help further. Maintain a helpful and respectful tone at all times. You are not the user, and you should never speak as the user (e.g., avoid “I replied” or “I think”). Instead, respond from the assistant point of view using polite and professional language.';
+const DEFAULT_SUMMARY_PROMPT = 'You are an assistant tasked with summarizing a set of emails. Please read all the emails provided below and write an overall summary that captures the main themes, important points, and any actionable items. Focus on conveying the big picture. Be concise. Do not summarize each email individually. Do not summarize each email individually. Do not summarize each email individually.';
+const DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct";
+
+function customPrompts(tone, relation) {
+  Tone = {
+    "長輩": "senior (e.g., elder, superior, or someone deserving respect)",
+    "平輩": "peer (e.g., friend or colleague of similar status)",
+    "晚輩": "junior (e.g., younger person or subordinate)"
+  };
+  Relation = {
+    "輕鬆": "Use a relaxed but respectful tone, addressing the sender as '您' in Chinese or with formal pronouns in English.",
+    "中等": "Use a moderate and respectful tone, with polite and natural phrasing. Address the sender as '您' in Chinese or with formal English pronouns.",
+    "正式": "Use a formal tone with clear guidance and appropriate encouragement."
+  };
+
+  return `You are a polite assistant helping me draft a reply email to the message below, from my perspective as the recipient. Based on the email content, infer that the sender is a ${Relation[relation]}. Write a brief reply (15-100 words) in the same language as the email body (English for English emails, Traditional Chinese for Chinese emails), starting the subject line with 'Subject:'. ${Tone[tone]} Do not edit or rewrite the original email. Only write a reply that reflects my point of view as the recipient.`;
+}
+
+const USER_ID = Session.getActiveUser().getEmail().split("@")[0];
+
+function buildAddOnHomepage(e) {
+  // 檢查是否處於信件檢視模式（即 e.gmail.messageId 存在）
+  if (e && e.gmail && e.gmail.messageId) {
+    return showReplyCard(e);
+  }
+
+  // 如果不在信件檢視模式，顯示原有的首頁卡片
+  const cache = CacheService.getUserCache();
+  let summary = cache.get("unreadSummary") || getUnreadSummary();
+  
+  const qaInput = CardService.newTextInput()
+    .setFieldName("qaQuestion")
+    .setTitle("向 Geraldo 詢問關於以上摘要…")
+    .setMultiline(false);
+  
+  const qaButton = CardService.newTextButton()
+    .setText("提問")
+    .setOnClickAction(CardService.newAction().setFunctionName("answerSummaryQuestion"))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+
+  const refreshBtn = CardService.newTextButton()
+    .setText("重新擷取未讀信件")
+    .setOnClickAction(CardService.newAction().setFunctionName("refreshSummary"))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle("未讀信件"))
+    .addSection(CardService.newCardSection()
+      .addWidget(CardService.newTextParagraph().setText(`<b>AI 信件總結：</b>${summary}`))
+      .addWidget(refreshBtn)
+      .addWidget(qaInput)
+      .addWidget(qaButton)
+    )
+    .addCardAction(CardService.newCardAction()
+      .setText("信件回覆")
+      .setOnClickAction(CardService.newAction().setFunctionName("showReplyCard")))
+    .addCardAction(CardService.newCardAction()
+      .setText("Geraldo Chat")
+      .setOnClickAction(CardService.newAction().setFunctionName("openChat")))
+    .addCardAction(CardService.newCardAction()
+      .setText("設定摘要天數")
+      .setOnClickAction(CardService.newAction().setFunctionName("showSettingsCard")))
+    .build();
+  return card;
+}
+
+function openChat() {
+  return CardService.newNavigation().pushCard(buildChatCard());
+}
+
+function getUnreadSummary() {
+  Logger.log("fetch summary");
+  const newSummary = HF_Summary();
+  CacheService.getUserCache().put("unreadSummary", newSummary, 300);
+  return newSummary;
+}
+
+function refreshSummary() {
+  const cache = CacheService.getUserCache();
+  cache.remove("unreadSummary");
+  clearHistory();
+
+  const payload = {
+    data: [USER_ID]
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    Logger.log('try to generate summary');
+    // 1. 第一次呼叫取得 event_id
+    const response = UrlFetchApp.fetch("https://email-addon-gmailaddon.hf.space/gradio_api/call/clear_kb", options);
+    const raw = response.getContentText();
+    // If the Space is waking up or returned an error HTML/text, bail early
+    if (response.getResponseCode() !== 200 || !raw.trim().startsWith('{')) {
+      Logger.log('In clear_kb(), HF Space returned non-JSON:\n' + raw);
+      return '⚠️ Hugging Face Space is busy or returned an error. Try again later.';
+    }
+
+    const json = JSON.parse(raw);
+    const eventId = json.event_id;
+
+    if (!eventId) {
+      Logger.log("無法取得 event_id: " + response.getContentText());
+      return "無法取得 event_id。";
+    }
+
+    // 2. 等待生成後撈取結果 (SSE format)
+    const resultResponse = UrlFetchApp.fetch(`https://email-addon-gmailaddon.hf.space/gradio_api/call/clear_kb/${eventId}`, {
+      muteHttpExceptions: true
+    });
+
+    const result = resultResponse.getContentText();
+    Logger.log(`clear message: ${result}`);
+  }
+  catch (e) {
+    Logger.log(`Failed to clear. Error: ${e}`);
+  }
+
+  return buildAddOnHomepage();
+}
+
+// 輔助函數：更新選擇並重新渲染卡片
+function updateSelection(e) {
+  const userProps = PropertiesService.getUserProperties();
+  const messageId = e.parameters.messageId;
+  if (e.parameters.tone) {
+    userProps.setProperty('selectedTone', e.parameters.tone);
+  }
+  if (e.parameters.relation) {
+    userProps.setProperty('selectedRelation', e.parameters.relation);
+  }
+  return CardService.newNavigation().updateCard(showReplyCard({ gmail: { messageId: messageId } }));
+}
+
+// 顯示回信卡片
+function showReplyCard(e) {
+  if (!e || !e.gmail || !e.gmail.messageId) {
+    Logger.log("錯誤：e 參數無效或缺少 gmail.messageId - " + JSON.stringify(e));
+    return CardService.newCardBuilder()
+      .setHeader(CardService.newCardHeader().setTitle("錯誤"))
+      .addSection(CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText("無法獲取郵件 ID，請在 Gmail 上下文中操作，例如開啟一封郵件後再試一次。")))
+      .build();
+  }
+
+  const messageId = e.gmail.messageId;
+  let message;
+  try {
+    message = GmailApp.getMessageById(messageId);
+    if (!message) {
+      throw new Error("郵件不存在");
+    }
+  } catch (error) {
+    Logger.log("錯誤：無法獲取郵件 - " + error);
+    return CardService.newCardBuilder()
+      .setHeader(CardService.newCardHeader().setTitle("錯誤"))
+      .addSection(CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText(`無法載入郵件，請確認郵件存在並重新嘗試。`)))
+      .build();
+  }
+
+  const subject = message.getSubject();
+  const body = message.getPlainBody();
+
+  if (!CardService || !CardService.newSelectionInput) {
+    Logger.log("錯誤：CardService 不可用");
+    return CardService.newCardBuilder()
+      .setHeader(CardService.newCardHeader().setTitle("錯誤"))
+      .addSection(CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText("CardService 不可用，請檢查環境設置或重新載入附加元件。")))
+      .build();
+  }
+
+  const userProps = PropertiesService.getUserProperties();
+  const selectedTone = userProps.getProperty('selectedTone') || "中等";
+  const selectedRelation = userProps.getProperty('selectedRelation') || "平輩";
+
+  // 語氣選擇按鈕
+  const toneButton1 = CardService.newTextButton()
+    .setText("輕鬆")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, tone: "輕鬆" }))
+    .setTextButtonStyle(selectedTone === "輕鬆" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const toneButton2 = CardService.newTextButton()
+    .setText("中等")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, tone: "中等" }))
+    .setTextButtonStyle(selectedTone === "中等" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const toneButton3 = CardService.newTextButton()
+    .setText("正式")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, tone: "正式" }))
+    .setTextButtonStyle(selectedTone === "正式" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const toneButtonSet = CardService.newButtonSet()
+    .addButton(toneButton1)
+    .addButton(toneButton2)
+    .addButton(toneButton3);
+
+  // 輩分選擇按鈕
+  const elderButton = CardService.newTextButton()
+    .setText("長輩")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, relation: "長輩" }))
+    .setTextButtonStyle(selectedRelation === "長輩" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const peerButton = CardService.newTextButton()
+    .setText("平輩")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, relation: "平輩" }))
+    .setTextButtonStyle(selectedRelation === "平輩" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const juniorButton = CardService.newTextButton()
+    .setText("晚輩")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("updateSelection")
+      .setParameters({ messageId: messageId, relation: "晚輩" }))
+    .setTextButtonStyle(selectedRelation === "晚輩" ? CardService.TextButtonStyle.FILLED : CardService.TextButtonStyle.TEXT);
+
+  const relationButtonSet = CardService.newButtonSet()
+    .addButton(elderButton)
+    .addButton(peerButton)
+    .addButton(juniorButton);
+
+  const simpReplyInput = CardService.newTextInput()
+    .setFieldName("simpReply")
+    .setTitle("回覆寄件者以下內容…")
+    .setMultiline(false);
+
+  // 送出按鈕
+  const submitButton = CardService.newTextButton()
+    .setText("送出")
+    .setOnClickAction(CardService.newAction()
+      .setFunctionName("generateReplyWithToneAndRelation")
+      .setParameters({ messageId: messageId }))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle("AI 回信建議"))
+    .addSection(CardService.newCardSection()
+      .addWidget(CardService.newTextParagraph().setText(`<b>信件主旨：</b> ${subject}`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>選擇語氣：</b>`))
+      .addWidget(toneButtonSet)
+      .addWidget(CardService.newTextParagraph().setText(`<b>選擇對象：</b>`))
+      .addWidget(relationButtonSet)
+      .addWidget(simpReplyInput)
+      .addWidget(submitButton)
+    )
+    .build();
+
+  if (e && e.gmail && e.gmail.messageId && !e.formInput) {
+    return card;
+  }
+  return CardService.newNavigation().pushCard(card);
+}
+
+// 生成回覆
+function generateReplyWithToneAndRelation(e) {
+  const messageId = e.parameters.messageId;
+  const userProps = PropertiesService.getUserProperties();
+  const tone = userProps.getProperty('selectedTone') || "中等";
+  const relation = userProps.getProperty('selectedRelation') || "平輩";
+  const simpReply = e.formInput?.simpReply || "";
+  Logger.log(`語氣：${tone}，輩分：${relation}`);
+
+  // 檢查是否已選擇語氣和輩分
+  if (!tone || !relation) {
+    return CardService.newCardBuilder()
+      .setHeader(CardService.newCardHeader().setTitle("錯誤"))
+      .addSection(CardService.newCardSection()
+        .addWidget(CardService.newTextParagraph().setText("請選擇語氣和對象後再送出。")))
+      .build();
+  }
+
+  const message = GmailApp.getMessageById(messageId);
+  const subject = message.getSubject();
+  const body = message.getPlainBody();
+
+  const systemPrompt = customPrompts(tone, relation) || DEFAULT_SYSTEM_PROMPT;
+
+  const reply = HF_Reply(`Subject: ${subject}\nBody: ${body}`, simpReply, DEFAULT_MODEL, systemPrompt);
+  const subjectMatch = reply.match(/^Subject: .*/m);
+  const subjectLine = subjectMatch ? subjectMatch[0].replace("Subject: ", "") : "(無主旨)";
+  let replyBody = reply;
+  if (subjectMatch) {
+    // 從 prompt 之後的部分開始保留
+    const index = reply.indexOf(subjectMatch[0]);
+    replyBody = reply.substring(index + subjectMatch[0].length).replace(/^(?:\r?\n)+/, "");
+  }
+  const bodyMatch = replyBody.match(/^Body: .*/m);
+  const bodyLine = bodyMatch ? bodyMatch[0].replace("Body: ", "") : replyBody;
+
+  // 清除選擇狀態
+  userProps.deleteProperty('selectedTone');
+  userProps.deleteProperty('selectedRelation');
+
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle("AI 回信建議"))
+    .addSection(CardService.newCardSection()
+      .addWidget(CardService.newTextParagraph().setText(`<b>信件主旨：</b> ${subject}`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>選擇的語氣：</b> ${tone}`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>選擇的對象：</b> ${relation}`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>AI 建議回覆：</b><br>`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>主旨：</b><br>${subjectLine}`))
+      .addWidget(CardService.newTextParagraph().setText(`<b>內容：</b><br>${bodyLine}`))
+    )
+    .build();
+
+  return CardService.newNavigation().pushCard(card);
+}
+
+// 儲存使用者 API key 功能
+function showApiKeyCard() {
+  const input = CardService.newTextInput()
+    .setFieldName("apiKey")
+    .setTitle("輸入 Hugging Face API Key");
+
+  const button = CardService.newTextButton()
+    .setText("儲存")
+    .setOnClickAction(CardService.newAction().setFunctionName("saveApiKey"))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+
+  const section = CardService.newCardSection()
+    .addWidget(input)
+    .addWidget(button);
+
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle("設定 API 金鑰"))
+    .addSection(section)
+    .build();
+
+  return CardService.newNavigation().pushCard(card);
+}
+
+function saveApiKey(e) {
+  const apiKey = e.commonEventObject.formInputs.apiKey.stringInputs.value[0];
+  if (apiKey) {
+    PropertiesService.getUserProperties().setProperty('HF_API_token', apiKey);
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText('API Key 已儲存'))
+      .build();
+  } else {
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText('請輸入有效的 API Key'))
+      .build();
+  }
+}
+
+//下拉選單天數
+function showSettingsCard() {
+  const userProps = PropertiesService.getUserProperties();
+  const savedDays = userProps.getProperty('summary_days') || '1';
+
+  const dropdown = CardService.newSelectionInput()
+    .setType(CardService.SelectionInputType.DROPDOWN)
+    .setTitle("選擇要總結的信件天數")
+    .setFieldName("summaryDays")
+    .setOnChangeAction(CardService.newAction().setFunctionName("saveDaysOnChange"));
+
+  for (let i = 1; i <= 7; i++) {
+    dropdown.addItem(`${i} 天內`, String(i), savedDays === String(i));
+  }
+
+  const section = CardService.newCardSection().addWidget(dropdown);
+
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle("設定信件摘要的時間範圍"))
+    .addSection(section)
+    .build();
+
+  return CardService.newNavigation().pushCard(card);
+}
+
+function saveDaysOnChange(e) {
+  const inputs = e.commonEventObject.formInputs;
+  const summaryDays = inputs.summaryDays?.stringInputs?.value?.[0];
+
+  if (summaryDays) {
+    PropertiesService.getUserProperties().setProperty('summary_days', summaryDays);
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText(`已儲存：${summaryDays} 天內的信件`))
+      .build();
+  }
+
+  return CardService.newActionResponseBuilder()
+    .setNotification(CardService.newNotification().setText('未能取得設定值'))
+    .build();
+}
+
+// 取得未讀信件
+function getUnreadEmails(limit = 5) {
+  const days = PropertiesService.getUserProperties().getProperty('summary_days') || 1;
+  const threads = GmailApp.search(`is:unread newer_than:${days}d`);
+  const emails = [];
+  Logger.log(`Get summary in ${days} days.`);
+
+  for (const thread of threads) {
+    const messages = thread.getMessages();
+    for (const msg of messages) {
+      emails.push({
+        subject: msg.getSubject(),
+        body: msg.getPlainBody(),
+        date: msg.getDate()
+      });
+      Logger.log(msg.getSubject());
+    }
+  }
+
+  return emails;
+}
+
+// 將 email 儲存在 HuggingFace
+function saveEmail(prompt) {
+  // const apiKey = PropertiesService.getUserProperties().getProperty('HF_API_token');
+  // if (!apiKey) {
+  //   throw new Error('Please enter your Hugging Face API key using the menu.');
+  // }
+
+  const payload = {
+    data: [prompt, USER_ID, 512, 0] //, model, apiKey
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    // 1. 第一次呼叫取得 event_id
+    const response = UrlFetchApp.fetch("https://email-addon-gmailaddon.hf.space/gradio_api/call/store_doc", options);
+    const raw = response.getContentText();
+    // If the Space is waking up or returned an error HTML/text, bail early
+    if (response.getResponseCode() !== 200 || !raw.trim().startsWith('{')) {
+      Logger.log('In saveEmail(), HF Space returned non-JSON:\n' + raw);
+      return '⚠️ Hugging Face Space is busy or returned an error. Try again later.';
+    }
+
+    const json = JSON.parse(raw);
+    const eventId = json.event_id;
+
+    if (!eventId) {
+      Logger.log("無法取得 event_id: " + response.getContentText());
+      return "無法取得 event_id。";
+    }
+
+    // 2. 等待生成後撈取結果 (SSE format)
+    const resultResponse = UrlFetchApp.fetch(`https://email-addon-gmailaddon.hf.space/gradio_api/call/store_doc/${eventId}`, {
+      muteHttpExceptions: true
+    });
+
+    const sseText = resultResponse.getContentText();
+
+    // 分行後找出以 "data: " 開頭的那行
+    return sseText;
+  } catch (e) {
+    Logger.log(e);
+    return "錯誤";
+  }
+}
+
+// 請求 HuggingFace 總結信件服務
+function generateSummary(prompt, model = DEFAULT_MODEL, systemPrompt = DEFAULT_SUMMARY_PROMPT) {
+  // const apiKey = PropertiesService.getUserProperties().getProperty('HF_API_token');
+  // if (!apiKey) {
+  //   throw new Error('Please enter your Hugging Face API key using the menu.');
+  // }
+
+  const completePrompt = systemPrompt + prompt;
+  const payload = {
+    data: [
+        systemPrompt, // system_prompt
+        "",         // context
+        prompt,                       // question
+        USER_ID,                        // user_id
+        "All",                        // history_flag
+        0.7,                           // temp
+        0.9,                          // top_p
+        40                             // top_k
+      ]
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    Logger.log('try to generate summary');
+    // 1. 第一次呼叫取得 event_id
+    const response = UrlFetchApp.fetch("https://email-addon-gmailaddon.hf.space/gradio_api/call/answer", options);
+    const raw = response.getContentText();
+    // If the Space is waking up or returned an error HTML/text, bail early
+    if (response.getResponseCode() !== 200 || !raw.trim().startsWith('{')) {
+      Logger.log('In generateSummary(), HF Space returned non-JSON:\n' + raw);
+      return '⚠️ Hugging Face Space is busy or returned an error. Try again later.';
+    }
+
+    const json = JSON.parse(raw);
+    const eventId = json.event_id;
+    Logger.log(`get summary event id: ${eventId}`);
+
+    if (!eventId) {
+      Logger.log("無法取得 event_id: " + response.getContentText());
+      return "無法取得 event_id。";
+    }
+
+    // 2. 等待生成後撈取結果 (SSE format)
+    const resultResponse = UrlFetchApp.fetch(`https://email-addon-gmailaddon.hf.space/gradio_api/call/answer/${eventId}`, {
+      muteHttpExceptions: true
+    });
+    Logger.log(`resultResponse: ${resultResponse}`);
+
+    const sseText = resultResponse.getContentText();
+    const data = extractCompleteData(sseText);
+    Logger.log(`Complete length: ${data.length} (...${data.slice(data.length - 5)})\nPrompt length: ${completePrompt.length} (...${completePrompt.slice(completePrompt.length - 5)})`);
+
+    Logger.log(`generateSummary() produces data content: ...${data.slice(data.length - 100)}`);
+
+    // 剪掉
+    const question = `[INST] ${prompt.trim()} [/INST]\n`;
+    const index = data.indexOf(question);
+    let trimmed = data;
+
+    if (index !== -1) {
+      // 從 prompt 之後的部分開始保留
+      trimmed = data.substring(index + question.length).replace(/^(?:\r?\n)+/, "");
+    }
+    return trimmed;
+    
+  } catch (e) {
+    Logger.log(e);
+    return "錯誤";
+  }
+}
+
+// 請求 HuggingFace 回覆服務
+function generateReply(prompt, simpReply = "", model = DEFAULT_MODEL, systemPrompt = DEFAULT_SYSTEM_PROMPT, begin = "主旨", history = "None") {
+  // const apiKey = PropertiesService.getUserProperties().getProperty('HF_API_token');
+  // if (!apiKey) {
+  //   throw new Error('Please enter your Hugging Face API key using the menu.');
+  // }
+
+  if (simpReply !== "") {
+    simpReply = "\nPlease write a reply saying that " + simpReply;
+  }
+
+  begin = "\n" + begin + "：";
+  const completePrompt = systemPrompt + prompt;
+  const payload = {
+    data: [
+        systemPrompt, // system_prompt
+        "",         // context
+        prompt + simpReply,                       // question
+        USER_ID,                        // user_id
+        "None",                        // history_flag
+        0.7,                           // temp
+        0.9,                          // top_p
+        40                             // top_k
+      ]
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  // 1. 第一次呼叫取得 event_id
+  const response = UrlFetchApp.fetch("https://email-addon-gmailaddon.hf.space/gradio_api/call/answer", options);
+  const raw = response.getContentText();
+  // If the Space is waking up or returned an error HTML/text, bail early
+  if (response.getResponseCode() !== 200 || !raw.trim().startsWith('{')) {
+    Logger.log('In generateReply(), HF Space returned non-JSON:\n' + raw);
+    return '⚠️ Hugging Face Space is busy or returned an error. Try again later.';
+  }
+
+  const json = JSON.parse(raw);
+  const eventId = json.event_id;
+
+  if (!eventId) {
+    Logger.log("無法取得 event_id: " + response.getContentText());
+    return "無法取得 event_id。";
+  }
+
+  // 2. 等待生成後撈取結果 (SSE format)
+  const resultResponse = UrlFetchApp.fetch(`https://email-addon-gmailaddon.hf.space/gradio_api/call/answer/${eventId}`, {
+    muteHttpExceptions: true
+  });
+
+  const sseText = resultResponse.getContentText();
+  Logger.log("SSE 回傳內容：\n" + sseText);
+
+  // 分行後找出以 "data: " 開頭的那行
+  data = extractCompleteData(sseText);
+  
+  // 剪掉   
+  const question = `[INST] ${prompt.trim()} [/INST]\n`;
+  const index = data.indexOf(question);
+  let trimmed = data;
+
+  if (index !== -1) {
+    // 從 prompt 之後的部分開始保留
+    trimmed = data.substring(index + question.length).replace(/^(?:\r?\n)+/, "");
+  }
+  else
+  {
+    Logger.log(`Failed to match: ${question}`)
+  }
+  return trimmed;
+}
+
+// 請求 HuggingFace 聊天服務
+function generateChat(context, prompt, model = DEFAULT_MODEL, systemPrompt = DEFAULT_SYSTEM_PROMPT + "When asked a yes-or-no question, always provide supporting context", begin = "主旨", history = "Some") {
+
+  begin = "\n" + begin + "：";
+  const payload = {
+    data: [
+        systemPrompt, // system_prompt
+        context,         // context
+        prompt,                       // question
+        USER_ID,                        // user_id
+        "Some",                        // history_flag
+        0.7,                           // temp
+        0.9,                          // top_p
+        40                             // top_k
+      ]
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  // 1. 第一次呼叫取得 event_id
+  const response = UrlFetchApp.fetch("https://email-addon-gmailaddon.hf.space/gradio_api/call/answer", options);
+  const raw = response.getContentText();
+  // If the Space is waking up or returned an error HTML/text, bail early
+  if (response.getResponseCode() !== 200 || !raw.trim().startsWith('{')) {
+    Logger.log('In generateChat(), HF Space returned non-JSON:\n' + raw);
+    return '⚠️ Hugging Face Space is busy or returned an error. Try again later.';
+  }
+
+  const json = JSON.parse(raw);
+  const eventId = json.event_id;
+
+  if (!eventId) {
+    Logger.log("無法取得 event_id: " + response.getContentText());
+    return "無法取得 event_id。";
+  }
+
+  // 2. 等待生成後撈取結果 (SSE format)
+  const resultResponse = UrlFetchApp.fetch(`https://email-addon-gmailaddon.hf.space/gradio_api/call/answer/${eventId}`, {
+    muteHttpExceptions: true
+  });
+
+  const sseText = resultResponse.getContentText();
+  // Logger.log("SSE 回傳內容：\n" + sseText);
+
+  // 分行後找出以 "data: " 開頭的那行
+  data = extractCompleteData(sseText);
+  Logger.log(`Chat message: ${data}`);
+  
+  // 剪掉  
+  const question = `[INST] ${prompt.trim()} [/INST]\n`;
+  const index = data.indexOf(question);
+  let trimmed = data;
+
+  if (index !== -1) {
+    // 從 prompt 之後的部分開始保留
+    trimmed = data.substring(index + question.length).replace(/^(?:\r?\n)+/, "");
+  }
+  return trimmed;
+}
+
+function extractCompleteData(sseText) { // 將回傳的 SSE 事件分行
+  const lines = sseText.split('\n');
+  let data = null;
+  let currentEvent = null;
+
+  for (let line of lines) {
+    if (line.startsWith('event:')) {
+      currentEvent = line.replace('event: ', '').trim();
+    } else if (line.startsWith('data:')) {
+      if (currentEvent === 'complete') {
+        const rawData = line.replace('data: ', '').trim();
+        try {
+          const parsed = JSON.parse(rawData);
+          return parsed[0];
+        } catch (e) {
+          Logger.log("JSON parse error: " + e);
+        }
+      }
+    }
+  }
+
+  Logger.log(sseText);
+  return "⚠️ 無法取得回覆，請檢查伺服器回傳內容格式。";
+}
+
+// 取得回覆
+function HF_Reply(prompt, simpReply = "", model = DEFAULT_MODEL, systemPrompt = DEFAULT_SYSTEM_PROMPT) {
+  try {
+    const response = generateReply(prompt, simpReply, model, systemPrompt);
+    if (response && response.length > 0) {
+      const generatedOutput = response.split(`</s>`).pop().trim();
+      return generatedOutput;
+    } else {
+      Logger.log(response);
+      return 'Error: Invalid response structure from Hugging Face API.';
+    }
+  } catch (error) {
+    return `Error: ${error.message}`;
+  }
+}
+
+function HF_Summary(model = DEFAULT_MODEL, systemPrompt = DEFAULT_SUMMARY_PROMPT) {
+  try {
+    const emails = getUnreadEmails(5);
+    emails.forEach(e => {
+      const content = `Subject：${e.subject}\nBody：${e.body}`;
+      const result = saveEmail(content);
+      Logger.log(result);
+    });
+    const response = generateSummary(`Please summerize all the above emails.`, model, systemPrompt);
+    if (response && response.length > 0) {
+      const generatedOutput = response.split(`</s>`).pop().trim();
+      return generatedOutput;
+    } else {
+      Logger.log(response);
+      return 'Error: Invalid response structure from Hugging Face API.';
+    }
+  } catch (error) {
+    return `Error: ${error.message}`;
+  }
+}
+
+function buildChatCard() {
+  const history = loadChat();
+  const section = CardService.newCardSection();
+
+  const recent = history.slice(-20);
+  recent.forEach(msg => section.addWidget(makeBubble(msg)));
+
+  const input = CardService.newTextInput()
+    .setFieldName('chatQuestion')
+    .setTitle('輸入訊息…')
+    .setMultiline(false);
+
+  const sendBtn = CardService.newTextButton()
+    .setText('送出')
+    .setOnClickAction(CardService.newAction().setFunctionName('sendChatMessage'))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+  
+  const clearBtn = CardService.newTextButton()
+    .setText('清除歷史紀錄')
+    .setOnClickAction(CardService.newAction().setFunctionName('clearHistory'))
+    .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+
+  section.addWidget(input).addWidget(sendBtn).addWidget(clearBtn);
+
+  return CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle('Geraldo Chat'))
+    .addSection(section)
+    .build();
+}
+
+function clearHistory() {
+  CacheService.getUserCache().remove(CHAT_KEY);
+  return CardService.newNavigation().updateCard(buildChatCard());
+}
+
+const DEFAULT_QA_PROMPT =
+  "You are a helpful assistant. " +
+  "Answer the user's question based ONLY on the summary provided. " +
+  "If the summary does not contain enough information, say you don't know.\n\n" +
+  "Summary:\n";
+
+function askGeraldo(question, model = DEFAULT_MODEL, systemPrompt = DEFAULT_QA_PROMPT) {
+  const raw = generateChat("", question, model, systemPrompt, begin="回覆");
+  return raw.split(`</s>`).pop().trim();
+}
+
+function sendChatMessage(e) {
+  const question = e.formInput?.chatQuestion || "";
+  if (!question.trim()) {
+    return CardService.newNavigation().updateCard(buildChatCard());
+  }
+  const history = loadChat();
+  history.push({role: 'user', text: question});
+
+  const transcript = history.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n');
+  const prompt = "Above is an ongoing chat and some emails as reference. Answer as Geraldo.";
+  Logger.log(`Chat so far:\n${transcript}`);
+
+  const answer = generateChat(`Chat so far:\n${transcript}`, prompt, DEFAULT_MODEL, DEFAULT_SYSTEM_PROMPT);
+  history.push({role: 'assistant', text: answer});
+  saveChat(history);
+
+  return CardService.newNavigation().updateCard(buildChatCard());
+}
+
+function makeBubble(msg) {
+  const prefix = msg.role === 'user' ? '<b>你：</b> ' : '<b>Geraldo：</b> ';
+  return CardService.newTextParagraph().setText(prefix + msg.text.replace(/\n/g, '<br/>'));
+}
+
+function answerSummaryQuestion(e) {
+  const question = e.formInput?.qaQuestion || "";
+  if (!question.trim()) {
+    return CardService.newNavigation().updateCard(buildAddOnHomepage());
+  }
+
+  const answer = askGeraldo(question);
+
+  const history = loadChat();
+  history.push({role: 'user', text: question});
+  history.push({role: 'assistant', text: answer});
+  saveChat(history);
+
+  return CardService.newNavigation().pushCard(buildChatCard());
+}
+
+const CHAT_KEY = 'geraldoChat';
+const CHAT_TTL_SECONDS = 3600;
+
+function loadChat() {
+  const cached = CacheService.getUserCache().get(CHAT_KEY);
+  return cached ? JSON.parse(cached) : [];
+}
+
+function saveChat(historyArray) {
+  CacheService.getUserCache().put(CHAT_KEY, JSON.stringify(historyArray), CHAT_TTL_SECONDS);
+}
